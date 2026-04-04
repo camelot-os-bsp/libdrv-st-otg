@@ -44,3 +44,9 @@ libdrv_st_otgfs = static_library(
   include_directories : drv_inc,
   install : true,
 )
+
+drvusbotgfs_dep = declare_dependency(
+  link_with : libdrv_st_otgfs,
+  include_directories : drv_inc,
+  dependencies : dependencies,
+)
