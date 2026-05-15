@@ -654,6 +654,7 @@ static int usbotgfs_isr(void *self, uint32_t IRQn)
     uint32_t gintsts;
     uint32_t clear_mask = 0UL;
 
+    /* there is no USB driver related private-data by now to use */
     (void)self;
 
     if (!usbotgfs_is_ready()) {
@@ -705,10 +706,6 @@ static int usbotgfs_isr(void *self, uint32_t IRQn)
 
     if (clear_mask != 0UL) {
         usbotgfs_write32(USB_GINTSTS_OFFSET, clear_mask);
-    }
-
-    if (merlin_platform_acknowledge_irq(&g_usbotgfs_driver, IRQn) != STATUS_OK) {
-        return -1;
     }
 
     return 0;

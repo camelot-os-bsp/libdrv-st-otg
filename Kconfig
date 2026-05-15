@@ -28,6 +28,7 @@ choice
       configured in USB standard mode, i.e. IN EP receive data, OUT EP send data.
 endchoice
 
+rsource 'subprojects/merlin/Kconfig'
 
 endmenu
 
