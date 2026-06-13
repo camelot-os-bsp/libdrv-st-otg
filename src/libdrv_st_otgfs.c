@@ -16,9 +16,60 @@
 #include <stdint.h>
 
 #include <merlin/io.h>
+#include <merlin/buses/usb.h>
 #include <merlin/helpers.h>
 
 #include <usbotgfs/libusbotgfs.h>
+
+/*
+ * Internal aliases keep the implementation readable while the public header
+ * exposes only the unified Merlin USB API.
+ */
+typedef usb_ioep_handler_t st_usbotgfs_ioep_handler_t;
+typedef enum usb_endpoint_state st_usbotgfs_ep_state_t;
+typedef enum usb_endpoint_mpsize st_usbotgfs_epx_mpsize_t;
+typedef enum usb_endpoint_type st_usbotgfs_ep_type_t;
+typedef enum usb_endpoint_direction st_usbotgfs_ep_dir_t;
+typedef enum usb_endpoint_toggle st_usbotgfs_ep_toggle_t;
+typedef enum usb_port_speed st_usbotgfs_port_speed_t;
+
+#define USBOTG_FS_EP0_MPSIZE_64BYTES USB_EP0_MPSIZE_64BYTES
+#define USBOTG_FS_EP0_MPSIZE_32BYTES USB_EP0_MPSIZE_32BYTES
+#define USBOTG_FS_EP0_MPSIZE_16BYTES USB_EP0_MPSIZE_16BYTES
+#define USBOTG_FS_EP0_MPSIZE_8BYTES USB_EP0_MPSIZE_8BYTES
+
+#define USBOTG_FS_EPx_MPSIZE_64BYTES USB_ENDPOINT_MPSIZE_64BYTES
+#define USBOTG_FS_EPx_MPSIZE_128BYTES USB_ENDPOINT_MPSIZE_128BYTES
+#define USBOTG_FS_EPx_MPSIZE_512BYTES USB_ENDPOINT_MPSIZE_512BYTES
+#define USBOTG_FS_EPx_MPSIZE_1024BYTES USB_ENDPOINT_MPSIZE_1024BYTES
+
+#define USB_FS_DXEPCTL_SD0PID_SEVNFRM USB_ENDPOINT_TOGGLE_DATA0
+#define USB_FS_DXEPCTL_SD1PID_SODDFRM USB_ENDPOINT_TOGGLE_DATA1
+
+#define USBOTG_FS_EP_TYPE_CONTROL USB_ENDPOINT_TYPE_CONTROL
+#define USBOTG_FS_EP_TYPE_ISOCHRONOUS USB_ENDPOINT_TYPE_ISOCHRONOUS
+#define USBOTG_FS_EP_TYPE_BULK USB_ENDPOINT_TYPE_BULK
+#define USBOTG_FS_EP_TYPE_INT USB_ENDPOINT_TYPE_INTERRUPT
+
+#define USBOTG_FS_EP_STATE_IDLE USB_ENDPOINT_STATE_IDLE
+#define USBOTG_FS_EP_STATE_SETUP_WIP USB_ENDPOINT_STATE_SETUP_WIP
+#define USBOTG_FS_EP_STATE_SETUP USB_ENDPOINT_STATE_SETUP
+#define USBOTG_FS_EP_STATE_STATUS USB_ENDPOINT_STATE_STATUS
+#define USBOTG_FS_EP_STATE_STALL USB_ENDPOINT_STATE_STALL
+#define USBOTG_FS_EP_STATE_DATA_IN_WIP USB_ENDPOINT_STATE_DATA_IN_WIP
+#define USBOTG_FS_EP_STATE_DATA_IN USB_ENDPOINT_STATE_DATA_IN
+#define USBOTG_FS_EP_STATE_DATA_OUT_WIP USB_ENDPOINT_STATE_DATA_OUT_WIP
+#define USBOTG_FS_EP_STATE_DATA_OUT USB_ENDPOINT_STATE_DATA_OUT
+#define USBOTG_FS_EP_STATE_INVALID USB_ENDPOINT_STATE_INVALID
+
+#define USBOTG_FS_EP_DIR_IN USB_ENDPOINT_DIR_IN
+#define USBOTG_FS_EP_DIR_OUT USB_ENDPOINT_DIR_OUT
+#define USBOTG_FS_EP_DIR_BOTH USB_ENDPOINT_DIR_BOTH
+
+#define USBOTG_FS_PORT_SPEED_LOW USB_PORT_SPEED_LOW
+#define USBOTG_FS_PORT_SPEED_FULL USB_PORT_SPEED_FULL
+#define USBOTG_FS_PORT_SPEED_HIGH USB_PORT_SPEED_HIGH
+#define USBOTG_FS_PORT_SPEED_UNKNOWN USB_PORT_SPEED_UNKNOWN
 
 #define USBOTGFS_NUM_EPS 8U
 #define USBOTGFS_DIR_IN_IDX 0U
@@ -163,13 +214,17 @@
 #define USB_RX_FIFO_WORDS          128U
 #define USB_NP_TX_FIFO_WORDS       64U
 
-struct usbotgfs_rx_ctx {
+struct st_usbotgfs_rx_ctx {
     uint8_t *dst;
     uint32_t expected;
     uint32_t received;
 };
 
-static int usbotgfs_isr(void *self, uint32_t IRQn);
+static int st_usbotgfs_isr(void *self, uint32_t IRQn);
+
+/* Internal helpers used before their definitions. */
+static int st_usbotgfs_send_zlp(uint8_t ep);
+static int st_usbotgfs_deactivate_endpoint(uint8_t ep, st_usbotgfs_ep_dir_t dir);
 
 static struct platform_device_driver g_usbotgfs_driver = {
     .devh = 0,
@@ -177,9 +232,8 @@ static struct platform_device_driver g_usbotgfs_driver = {
     .devinfo = NULL,
     .name = "stm32 usbotgfs minimal driver",
     .compatible = "st,stm32-otgfs",
-    .driver_fops = NULL,
     .platform_fops = {
-        .isr = usbotgfs_isr,
+        .isr = st_usbotgfs_isr,
     },
     .type = DEVICE_TYPE_USB,
 };
@@ -188,51 +242,51 @@ static bool g_initialized;
 static bool g_mapped;
 static bool g_global_stall;
 
-static usbotgfs_port_speed_t g_port_speed = USBOTG_FS_PORT_SPEED_UNKNOWN;
+static st_usbotgfs_port_speed_t g_port_speed = USBOTG_FS_PORT_SPEED_UNKNOWN;
 
-static usbotgfs_ep_state_t g_ep_state[USBOTGFS_NUM_EPS][2];
-static usbotgfs_epx_mpsize_t g_ep_mpsize[USBOTGFS_NUM_EPS][2];
-static usbotgfs_ep_type_t g_ep_type[USBOTGFS_NUM_EPS][2];
-static usbotgfs_ioep_handler_t g_ep_handler[USBOTGFS_NUM_EPS][2];
+static st_usbotgfs_ep_state_t g_ep_state[USBOTGFS_NUM_EPS][2];
+static st_usbotgfs_epx_mpsize_t g_ep_mpsize[USBOTGFS_NUM_EPS][2];
+static st_usbotgfs_ep_type_t g_ep_type[USBOTGFS_NUM_EPS][2];
+static st_usbotgfs_ioep_handler_t g_ep_handler[USBOTGFS_NUM_EPS][2];
 static uint32_t g_ep_last_tx_size[USBOTGFS_NUM_EPS];
-static struct usbotgfs_rx_ctx g_ep_rx[USBOTGFS_NUM_EPS];
+static struct st_usbotgfs_rx_ctx g_ep_rx[USBOTGFS_NUM_EPS];
 
-static inline size_t usbotgfs_reg(size_t offset)
+static inline size_t st_usbotgfs_reg(size_t offset)
 {
     return ((size_t)g_usbotgfs_driver.devinfo->baseaddr + offset);
 }
 
-static inline uint32_t usbotgfs_read32(size_t offset)
+static inline uint32_t st_usbotgfs_read32(size_t offset)
 {
-    return merlin_ioread32(usbotgfs_reg(offset));
+    return merlin_ioread32(st_usbotgfs_reg(offset));
 }
 
-static inline void usbotgfs_write32(size_t offset, uint32_t value)
+static inline void st_usbotgfs_write32(size_t offset, uint32_t value)
 {
-    merlin_iowrite32(usbotgfs_reg(offset), value);
+    merlin_iowrite32(st_usbotgfs_reg(offset), value);
 }
 
-static inline size_t usbotgfs_diep_offset(uint8_t ep, size_t reg)
+static inline size_t st_usbotgfs_diep_offset(uint8_t ep, size_t reg)
 {
     return USB_DIEP_BASE + ((size_t)ep * USB_DIEP_STRIDE) + reg;
 }
 
-static inline size_t usbotgfs_doep_offset(uint8_t ep, size_t reg)
+static inline size_t st_usbotgfs_doep_offset(uint8_t ep, size_t reg)
 {
     return USB_DOEP_BASE + ((size_t)ep * USB_DOEP_STRIDE) + reg;
 }
 
-static inline size_t usbotgfs_fifo_offset(uint8_t fifo_idx)
+static inline size_t st_usbotgfs_fifo_offset(uint8_t fifo_idx)
 {
     return USB_FIFO_BASE_OFFSET + ((size_t)fifo_idx * USB_FIFO_STRIDE);
 }
 
-static inline bool usbotgfs_is_ready(void)
+static inline bool st_usbotgfs_is_ready(void)
 {
     return (g_usbotgfs_driver.devh != 0) && (g_usbotgfs_driver.devinfo != NULL);
 }
 
-static int usbotgfs_dir_to_index(usbotgfs_ep_dir_t dir)
+static int st_usbotgfs_dir_to_index(st_usbotgfs_ep_dir_t dir)
 {
     switch (dir) {
         case USBOTG_FS_EP_DIR_IN:
@@ -244,7 +298,7 @@ static int usbotgfs_dir_to_index(usbotgfs_ep_dir_t dir)
     }
 }
 
-static uint32_t usbotgfs_ep0_mps_to_field(uint16_t mps)
+static uint32_t st_usbotgfs_ep0_mps_to_field(uint16_t mps)
 {
     switch (mps) {
         case 64U:
@@ -260,9 +314,9 @@ static uint32_t usbotgfs_ep0_mps_to_field(uint16_t mps)
     }
 }
 
-static uint16_t usbotgfs_ep_get_mps(uint8_t ep, usbotgfs_ep_dir_t dir)
+static uint16_t st_usbotgfs_ep_get_mps(uint8_t ep, st_usbotgfs_ep_dir_t dir)
 {
-    const int idx = usbotgfs_dir_to_index(dir);
+    const int idx = st_usbotgfs_dir_to_index(dir);
 
     if (idx < 0 || ep >= USBOTGFS_NUM_EPS) {
         return 64U;
@@ -273,10 +327,10 @@ static uint16_t usbotgfs_ep_get_mps(uint8_t ep, usbotgfs_ep_dir_t dir)
     return (uint16_t)g_ep_mpsize[ep][idx];
 }
 
-static void usbotgfs_notify(uint8_t ep, usbotgfs_ep_dir_t dir, uint32_t size)
+static void st_usbotgfs_notify(uint8_t ep, st_usbotgfs_ep_dir_t dir, uint32_t size)
 {
-    const int idx = usbotgfs_dir_to_index(dir);
-    usbotgfs_ioep_handler_t handler;
+    const int idx = st_usbotgfs_dir_to_index(dir);
+    st_usbotgfs_ioep_handler_t handler;
 
     if (idx < 0 || ep >= USBOTGFS_NUM_EPS) {
         return;
@@ -288,70 +342,70 @@ static void usbotgfs_notify(uint8_t ep, usbotgfs_ep_dir_t dir, uint32_t size)
     }
 }
 
-static int usbotgfs_wait_grstctl_clear(uint32_t mask)
+static int st_usbotgfs_wait_grstctl_clear(uint32_t mask)
 {
     for (uint32_t i = 0U; i < USBOTGFS_TIMEOUT_POLLS; i++) {
-        if ((usbotgfs_read32(USB_GRSTCTL_OFFSET) & mask) == 0UL) {
+        if ((st_usbotgfs_read32(USB_GRSTCTL_OFFSET) & mask) == 0UL) {
             return 0;
         }
     }
     return -1;
 }
 
-static int usbotgfs_wait_ahb_idle(void)
+static int st_usbotgfs_wait_ahb_idle(void)
 {
     for (uint32_t i = 0U; i < USBOTGFS_TIMEOUT_POLLS; i++) {
-        if ((usbotgfs_read32(USB_GRSTCTL_OFFSET) & USB_GRSTCTL_AHBIDL) != 0UL) {
+        if ((st_usbotgfs_read32(USB_GRSTCTL_OFFSET) & USB_GRSTCTL_AHBIDL) != 0UL) {
             return 0;
         }
     }
     return -1;
 }
 
-static int usbotgfs_core_reset(void)
+static int st_usbotgfs_core_reset(void)
 {
     uint32_t rst;
 
-    if (usbotgfs_wait_ahb_idle() != 0) {
+    if (st_usbotgfs_wait_ahb_idle() != 0) {
         return -1;
     }
 
-    rst = usbotgfs_read32(USB_GRSTCTL_OFFSET);
+    rst = st_usbotgfs_read32(USB_GRSTCTL_OFFSET);
     rst |= USB_GRSTCTL_CSRST;
-    usbotgfs_write32(USB_GRSTCTL_OFFSET, rst);
+    st_usbotgfs_write32(USB_GRSTCTL_OFFSET, rst);
 
-    if (usbotgfs_wait_grstctl_clear(USB_GRSTCTL_CSRST) != 0) {
+    if (st_usbotgfs_wait_grstctl_clear(USB_GRSTCTL_CSRST) != 0) {
         return -1;
     }
 
-    return usbotgfs_wait_ahb_idle();
+    return st_usbotgfs_wait_ahb_idle();
 }
 
-static int usbotgfs_flush_rx_fifo(void)
+static int st_usbotgfs_flush_rx_fifo(void)
 {
-    uint32_t rst = usbotgfs_read32(USB_GRSTCTL_OFFSET);
+    uint32_t rst = st_usbotgfs_read32(USB_GRSTCTL_OFFSET);
 
     rst |= USB_GRSTCTL_RXFFLSH;
-    usbotgfs_write32(USB_GRSTCTL_OFFSET, rst);
+    st_usbotgfs_write32(USB_GRSTCTL_OFFSET, rst);
 
-    return usbotgfs_wait_grstctl_clear(USB_GRSTCTL_RXFFLSH);
+    return st_usbotgfs_wait_grstctl_clear(USB_GRSTCTL_RXFFLSH);
 }
 
-static int usbotgfs_flush_tx_fifo(uint32_t fifo_num)
+static int st_usbotgfs_flush_tx_fifo(uint32_t fifo_num)
 {
-    uint32_t rst = usbotgfs_read32(USB_GRSTCTL_OFFSET);
+    uint32_t rst = st_usbotgfs_read32(USB_GRSTCTL_OFFSET);
 
     rst &= ~((uint32_t)0x1FUL << USB_GRSTCTL_TXFNUM_SHIFT);
     rst |= (fifo_num << USB_GRSTCTL_TXFNUM_SHIFT);
     rst |= USB_GRSTCTL_TXFFLSH;
-    usbotgfs_write32(USB_GRSTCTL_OFFSET, rst);
+    st_usbotgfs_write32(USB_GRSTCTL_OFFSET, rst);
 
-    return usbotgfs_wait_grstctl_clear(USB_GRSTCTL_TXFFLSH);
+    return st_usbotgfs_wait_grstctl_clear(USB_GRSTCTL_TXFFLSH);
 }
 
-static void usbotgfs_update_port_speed(void)
+static void st_usbotgfs_update_port_speed(void)
 {
-    const uint32_t enumspd = (usbotgfs_read32(USB_DSTS_OFFSET) & USB_DSTS_ENUMSPD_MASK) >> USB_DSTS_ENUMSPD_SHIFT;
+    const uint32_t enumspd = (st_usbotgfs_read32(USB_DSTS_OFFSET) & USB_DSTS_ENUMSPD_MASK) >> USB_DSTS_ENUMSPD_SHIFT;
 
     switch (enumspd) {
         case USB_DSTS_ENUMSPD_HS:
@@ -367,7 +421,7 @@ static void usbotgfs_update_port_speed(void)
     }
 }
 
-static void usbotgfs_reset_runtime_state(void)
+static void st_usbotgfs_reset_runtime_state(void)
 {
     for (size_t ep = 0U; ep < USBOTGFS_NUM_EPS; ep++) {
         g_ep_last_tx_size[ep] = 0U;
@@ -384,33 +438,33 @@ static void usbotgfs_reset_runtime_state(void)
     }
 }
 
-static void usbotgfs_arm_ep0_setup_reception(void)
+static void st_usbotgfs_arm_ep0_setup_reception(void)
 {
     uint32_t doepctl0;
 
-    usbotgfs_write32(usbotgfs_doep_offset(0U, USB_DOEPTSIZ_OFFSET),
+    st_usbotgfs_write32(st_usbotgfs_doep_offset(0U, USB_DOEPTSIZ_OFFSET),
                      USB_DOEPTSIZ0_STUPCNT_3 |
                      (1UL << USB_DXEPTSIZ_PKTCNT_SHIFT) |
                      24UL);
 
-    doepctl0 = usbotgfs_read32(usbotgfs_doep_offset(0U, USB_DOEPCTL_OFFSET));
+    doepctl0 = st_usbotgfs_read32(st_usbotgfs_doep_offset(0U, USB_DOEPCTL_OFFSET));
     doepctl0 |= USB_DXEPCTL_USBAEP | USB_DXEPCTL_CNAK | USB_DXEPCTL_EPENA;
     doepctl0 &= ~USB_DXEPCTL_EPDIS;
-    usbotgfs_write32(usbotgfs_doep_offset(0U, USB_DOEPCTL_OFFSET), doepctl0);
+    st_usbotgfs_write32(st_usbotgfs_doep_offset(0U, USB_DOEPCTL_OFFSET), doepctl0);
 }
 
-static int usbotgfs_configure_fifos(void)
+static int st_usbotgfs_configure_fifos(void)
 {
     static const uint16_t tx_fifo_words[USBOTGFS_NUM_EPS - 1U] = { 32U, 32U, 32U, 8U, 8U, 8U, 8U };
     uint32_t tx_start = USB_RX_FIFO_WORDS + USB_NP_TX_FIFO_WORDS;
 
-    usbotgfs_write32(USB_GRXFSIZ_OFFSET, USB_RX_FIFO_WORDS);
-    usbotgfs_write32(USB_GNPTXFSIZ_OFFSET, ((uint32_t)USB_NP_TX_FIFO_WORDS << 16) | USB_RX_FIFO_WORDS);
+    st_usbotgfs_write32(USB_GRXFSIZ_OFFSET, USB_RX_FIFO_WORDS);
+    st_usbotgfs_write32(USB_GNPTXFSIZ_OFFSET, ((uint32_t)USB_NP_TX_FIFO_WORDS << 16) | USB_RX_FIFO_WORDS);
 
     for (uint8_t ep = 1U; ep < USBOTGFS_NUM_EPS; ep++) {
         const uint32_t depth = tx_fifo_words[ep - 1U];
 
-        usbotgfs_write32(USB_DIEPTXF_OFFSET(ep), (depth << 16) | tx_start);
+        st_usbotgfs_write32(USB_DIEPTXF_OFFSET(ep), (depth << 16) | tx_start);
         tx_start += depth;
     }
 
@@ -421,7 +475,7 @@ static int usbotgfs_configure_fifos(void)
     return 0;
 }
 
-static void usbotgfs_configure_device_interrupts(void)
+static void st_usbotgfs_configure_device_interrupts(void)
 {
     const uint32_t gintmsk = USB_GINTSTS_USBRST |
                              USB_GINTSTS_ENUMDNE |
@@ -432,16 +486,16 @@ static void usbotgfs_configure_device_interrupts(void)
                              USB_GINTSTS_IEPINT |
                              USB_GINTSTS_OEPINT;
 
-    usbotgfs_write32(USB_DIEPMSK_OFFSET, USB_DIEPINT_XFRC);
-    usbotgfs_write32(USB_DOEPMSK_OFFSET, USB_DOEPINT_XFRC | USB_DOEPINT_STUP);
-    usbotgfs_write32(USB_DAINTMSK_OFFSET, (1UL << 0) | (1UL << 16));
-    usbotgfs_write32(USB_DIEPEMPMSK_OFFSET, 0UL);
+    st_usbotgfs_write32(USB_DIEPMSK_OFFSET, USB_DIEPINT_XFRC);
+    st_usbotgfs_write32(USB_DOEPMSK_OFFSET, USB_DOEPINT_XFRC | USB_DOEPINT_STUP);
+    st_usbotgfs_write32(USB_DAINTMSK_OFFSET, (1UL << 0) | (1UL << 16));
+    st_usbotgfs_write32(USB_DIEPEMPMSK_OFFSET, 0UL);
 
-    usbotgfs_write32(USB_GINTSTS_OFFSET, 0xFFFFFFFFUL);
-    usbotgfs_write32(USB_GINTMSK_OFFSET, gintmsk);
+    st_usbotgfs_write32(USB_GINTSTS_OFFSET, 0xFFFFFFFFUL);
+    st_usbotgfs_write32(USB_GINTMSK_OFFSET, gintmsk);
 }
 
-static int usbotgfs_core_device_init(void)
+static int st_usbotgfs_core_device_init(void)
 {
     uint32_t gahbcfg;
     uint32_t gusbcfg;
@@ -449,67 +503,67 @@ static int usbotgfs_core_device_init(void)
     uint32_t dcfg;
     uint32_t dctl;
 
-    if (!usbotgfs_is_ready()) {
+    if (!st_usbotgfs_is_ready()) {
         return -1;
     }
 
-    if (usbotgfs_core_reset() != 0) {
+    if (st_usbotgfs_core_reset() != 0) {
         return -1;
     }
 
-    gusbcfg = usbotgfs_read32(USB_GUSBCFG_OFFSET);
+    gusbcfg = st_usbotgfs_read32(USB_GUSBCFG_OFFSET);
     gusbcfg |= USB_GUSBCFG_PHYSEL | USB_GUSBCFG_FDMOD;
     gusbcfg &= ~USB_GUSBCFG_TRDT_MASK;
     gusbcfg |= (6UL << USB_GUSBCFG_TRDT_SHIFT);
-    usbotgfs_write32(USB_GUSBCFG_OFFSET, gusbcfg);
+    st_usbotgfs_write32(USB_GUSBCFG_OFFSET, gusbcfg);
 
-    gccfg = usbotgfs_read32(USB_GCCFG_OFFSET);
+    gccfg = st_usbotgfs_read32(USB_GCCFG_OFFSET);
     gccfg |= USB_GCCFG_PWRDWN | USB_GCCFG_VBUSBSEN;
-    usbotgfs_write32(USB_GCCFG_OFFSET, gccfg);
+    st_usbotgfs_write32(USB_GCCFG_OFFSET, gccfg);
 
-    if (usbotgfs_configure_fifos() != 0) {
+    if (st_usbotgfs_configure_fifos() != 0) {
         return -1;
     }
-    if (usbotgfs_flush_rx_fifo() != 0) {
+    if (st_usbotgfs_flush_rx_fifo() != 0) {
         return -1;
     }
-    if (usbotgfs_flush_tx_fifo(USB_GRSTCTL_TXFNUM_ALL) != 0) {
+    if (st_usbotgfs_flush_tx_fifo(USB_GRSTCTL_TXFNUM_ALL) != 0) {
         return -1;
     }
 
-    dcfg = usbotgfs_read32(USB_DCFG_OFFSET);
+    dcfg = st_usbotgfs_read32(USB_DCFG_OFFSET);
     dcfg &= ~USB_DCFG_DSPD_MASK;
     dcfg |= USB_DCFG_DSPD_FS_48MHZ;
     dcfg &= ~USB_DCFG_DAD_MASK;
-    usbotgfs_write32(USB_DCFG_OFFSET, dcfg);
+    st_usbotgfs_write32(USB_DCFG_OFFSET, dcfg);
 
-    usbotgfs_write32(USB_DVBUSDIS_OFFSET, 0UL);
+    st_usbotgfs_write32(USB_DVBUSDIS_OFFSET, 0UL);
 
     /* EP0 baseline configuration */
-    usbotgfs_write32(usbotgfs_diep_offset(0U, USB_DIEPCTL_OFFSET),
-                     USB_DXEPCTL_USBAEP | usbotgfs_ep0_mps_to_field(64U));
-    usbotgfs_write32(usbotgfs_doep_offset(0U, USB_DOEPCTL_OFFSET),
-                     USB_DXEPCTL_USBAEP | usbotgfs_ep0_mps_to_field(64U));
+    st_usbotgfs_write32(st_usbotgfs_diep_offset(0U, USB_DIEPCTL_OFFSET),
+                     USB_DXEPCTL_USBAEP | st_usbotgfs_ep0_mps_to_field(64U));
+    st_usbotgfs_write32(st_usbotgfs_doep_offset(0U, USB_DOEPCTL_OFFSET),
+                     USB_DXEPCTL_USBAEP | st_usbotgfs_ep0_mps_to_field(64U));
 
-    usbotgfs_arm_ep0_setup_reception();
-    usbotgfs_configure_device_interrupts();
+    st_usbotgfs_arm_ep0_setup_reception();
+    st_usbotgfs_configure_device_interrupts();
 
-    gahbcfg = usbotgfs_read32(USB_GAHBCFG_OFFSET);
+    gahbcfg = st_usbotgfs_read32(USB_GAHBCFG_OFFSET);
     gahbcfg |= USB_GAHBCFG_GINT;
-    usbotgfs_write32(USB_GAHBCFG_OFFSET, gahbcfg);
+    st_usbotgfs_write32(USB_GAHBCFG_OFFSET, gahbcfg);
 
-    dctl = usbotgfs_read32(USB_DCTL_OFFSET);
+    dctl = st_usbotgfs_read32(USB_DCTL_OFFSET);
     dctl &= ~USB_DCTL_SDIS;
-    usbotgfs_write32(USB_DCTL_OFFSET, dctl);
+    st_usbotgfs_write32(USB_DCTL_OFFSET, dctl);
 
-    usbotgfs_update_port_speed();
+    st_usbotgfs_update_port_speed();
 
     return 0;
 }
 
-static void usbotgfs_fifo_write(uint8_t fifo_idx, const uint8_t *src, uint32_t size)
+static void st_usbotgfs_fifo_write(uint8_t fifo_idx, const uint8_t *src, uint32_t size)
 {
-    const size_t fifo_addr = usbotgfs_reg(usbotgfs_fifo_offset(fifo_idx));
+    const size_t fifo_addr = st_usbotgfs_reg(st_usbotgfs_fifo_offset(fifo_idx));
     const uint32_t words = (size + 3U) / 4U;
 
     for (uint32_t i = 0U; i < words; i++) {
@@ -525,9 +579,9 @@ static void usbotgfs_fifo_write(uint8_t fifo_idx, const uint8_t *src, uint32_t s
     }
 }
 
-static void usbotgfs_fifo_read_to_ep_buffer(uint8_t ep, uint32_t size)
+static void st_usbotgfs_fifo_read_to_ep_buffer(uint8_t ep, uint32_t size)
 {
-    const size_t fifo_addr = usbotgfs_reg(usbotgfs_fifo_offset(0U));
+    const size_t fifo_addr = st_usbotgfs_reg(st_usbotgfs_fifo_offset(0U));
     const uint32_t words = (size + 3U) / 4U;
     uint32_t remaining = size;
 
@@ -551,10 +605,10 @@ static void usbotgfs_fifo_read_to_ep_buffer(uint8_t ep, uint32_t size)
     }
 }
 
-static void usbotgfs_handle_rxflvl(void)
+static void st_usbotgfs_handle_rxflvl(void)
 {
-    while ((usbotgfs_read32(USB_GINTSTS_OFFSET) & USB_GINTSTS_RXFLVL) != 0UL) {
-        const uint32_t rxstsp = usbotgfs_read32(USB_GRXSTSP_OFFSET);
+    while ((st_usbotgfs_read32(USB_GINTSTS_OFFSET) & USB_GINTSTS_RXFLVL) != 0UL) {
+        const uint32_t rxstsp = st_usbotgfs_read32(USB_GRXSTSP_OFFSET);
         const uint8_t ep = (uint8_t)(rxstsp & USB_GRXSTSP_EPNUM_MASK);
         const uint32_t bcnt = (rxstsp & USB_GRXSTSP_BCNT_MASK) >> USB_GRXSTSP_BCNT_SHIFT;
         const uint32_t pktsts = (rxstsp & USB_GRXSTSP_PKTSTS_MASK) >> USB_GRXSTSP_PKTSTS_SHIFT;
@@ -567,13 +621,13 @@ static void usbotgfs_handle_rxflvl(void)
             case USB_PKTSTS_SETUP_RX:
                 g_ep_state[ep][USBOTGFS_DIR_OUT_IDX] = USBOTG_FS_EP_STATE_SETUP_WIP;
                 if (bcnt != 0U) {
-                    usbotgfs_fifo_read_to_ep_buffer(ep, bcnt);
+                    st_usbotgfs_fifo_read_to_ep_buffer(ep, bcnt);
                 }
                 break;
             case USB_PKTSTS_OUT_RX:
                 g_ep_state[ep][USBOTGFS_DIR_OUT_IDX] = USBOTG_FS_EP_STATE_DATA_OUT_WIP;
                 if (bcnt != 0U) {
-                    usbotgfs_fifo_read_to_ep_buffer(ep, bcnt);
+                    st_usbotgfs_fifo_read_to_ep_buffer(ep, bcnt);
                 }
                 break;
             case USB_PKTSTS_SETUP_DONE:
@@ -588,9 +642,9 @@ static void usbotgfs_handle_rxflvl(void)
     }
 }
 
-static void usbotgfs_handle_iepint(void)
+static void st_usbotgfs_handle_iepint(void)
 {
-    const uint32_t daint = usbotgfs_read32(USB_DAINT_OFFSET) & usbotgfs_read32(USB_DAINTMSK_OFFSET);
+    const uint32_t daint = st_usbotgfs_read32(USB_DAINT_OFFSET) & st_usbotgfs_read32(USB_DAINTMSK_OFFSET);
     const uint32_t in_pending = daint & 0xFFFFUL;
 
     for (uint8_t ep = 0U; ep < USBOTGFS_NUM_EPS; ep++) {
@@ -600,22 +654,22 @@ static void usbotgfs_handle_iepint(void)
             continue;
         }
 
-        const size_t diepint_off = usbotgfs_diep_offset(ep, USB_DIEPINT_OFFSET);
-        const uint32_t diepint = usbotgfs_read32(diepint_off);
+        const size_t diepint_off = st_usbotgfs_diep_offset(ep, USB_DIEPINT_OFFSET);
+        const uint32_t diepint = st_usbotgfs_read32(diepint_off);
 
-        usbotgfs_write32(diepint_off, diepint);
+        st_usbotgfs_write32(diepint_off, diepint);
 
         if ((diepint & USB_DIEPINT_XFRC) != 0UL) {
             g_ep_state[ep][USBOTGFS_DIR_IN_IDX] = USBOTG_FS_EP_STATE_DATA_IN;
-            usbotgfs_notify(ep, USBOTG_FS_EP_DIR_IN, g_ep_last_tx_size[ep]);
+            st_usbotgfs_notify(ep, USBOTG_FS_EP_DIR_IN, g_ep_last_tx_size[ep]);
             (void)usbctrl_handle_inepevent(g_usbotgfs_driver.label, g_ep_last_tx_size[ep], ep);
         }
     }
 }
 
-static void usbotgfs_handle_oepint(void)
+static void st_usbotgfs_handle_oepint(void)
 {
-    const uint32_t daint = usbotgfs_read32(USB_DAINT_OFFSET) & usbotgfs_read32(USB_DAINTMSK_OFFSET);
+    const uint32_t daint = st_usbotgfs_read32(USB_DAINT_OFFSET) & st_usbotgfs_read32(USB_DAINTMSK_OFFSET);
     const uint32_t out_pending = (daint >> 16U) & 0xFFFFUL;
 
     for (uint8_t ep = 0U; ep < USBOTGFS_NUM_EPS; ep++) {
@@ -625,31 +679,31 @@ static void usbotgfs_handle_oepint(void)
             continue;
         }
 
-        const size_t doepint_off = usbotgfs_doep_offset(ep, USB_DOEPINT_OFFSET);
-        const uint32_t doepint = usbotgfs_read32(doepint_off);
+        const size_t doepint_off = st_usbotgfs_doep_offset(ep, USB_DOEPINT_OFFSET);
+        const uint32_t doepint = st_usbotgfs_read32(doepint_off);
 
-        usbotgfs_write32(doepint_off, doepint);
+        st_usbotgfs_write32(doepint_off, doepint);
 
         if ((doepint & USB_DOEPINT_STUP) != 0UL) {
             g_ep_state[ep][USBOTGFS_DIR_OUT_IDX] = USBOTG_FS_EP_STATE_SETUP;
-            usbotgfs_notify(ep, USBOTG_FS_EP_DIR_OUT, g_ep_rx[ep].received);
+            st_usbotgfs_notify(ep, USBOTG_FS_EP_DIR_OUT, g_ep_rx[ep].received);
             (void)usbctrl_handle_outepevent(g_usbotgfs_driver.label, g_ep_rx[ep].received, ep);
             g_ep_rx[ep].received = 0U;
             if (ep == 0U) {
-                usbotgfs_arm_ep0_setup_reception();
+                st_usbotgfs_arm_ep0_setup_reception();
             }
         }
 
         if ((doepint & USB_DOEPINT_XFRC) != 0UL) {
             g_ep_state[ep][USBOTGFS_DIR_OUT_IDX] = USBOTG_FS_EP_STATE_DATA_OUT;
-            usbotgfs_notify(ep, USBOTG_FS_EP_DIR_OUT, g_ep_rx[ep].received);
+            st_usbotgfs_notify(ep, USBOTG_FS_EP_DIR_OUT, g_ep_rx[ep].received);
             (void)usbctrl_handle_outepevent(g_usbotgfs_driver.label, g_ep_rx[ep].received, ep);
             g_ep_rx[ep].received = 0U;
         }
     }
 }
 
-static int usbotgfs_isr(void *self, uint32_t IRQn)
+static int st_usbotgfs_isr(void *self, uint32_t IRQn)
 {
     uint32_t gintsts;
     uint32_t clear_mask = 0UL;
@@ -657,35 +711,35 @@ static int usbotgfs_isr(void *self, uint32_t IRQn)
     /* there is no USB driver related private-data by now to use */
     (void)self;
 
-    if (!usbotgfs_is_ready()) {
+    if (!st_usbotgfs_is_ready()) {
         return -1;
     }
 
-    gintsts = usbotgfs_read32(USB_GINTSTS_OFFSET) & usbotgfs_read32(USB_GINTMSK_OFFSET);
+    gintsts = st_usbotgfs_read32(USB_GINTSTS_OFFSET) & st_usbotgfs_read32(USB_GINTMSK_OFFSET);
 
     if ((gintsts & USB_GINTSTS_USBRST) != 0UL) {
-        usbotgfs_reset_runtime_state();
-        usbotgfs_arm_ep0_setup_reception();
+        st_usbotgfs_reset_runtime_state();
+        st_usbotgfs_arm_ep0_setup_reception();
         (void)usbctrl_handle_reset(g_usbotgfs_driver.label);
         clear_mask |= USB_GINTSTS_USBRST;
     }
 
     if ((gintsts & USB_GINTSTS_ENUMDNE) != 0UL) {
-        usbotgfs_update_port_speed();
+        st_usbotgfs_update_port_speed();
         clear_mask |= USB_GINTSTS_ENUMDNE;
     }
 
     if ((gintsts & USB_GINTSTS_RXFLVL) != 0UL) {
-        usbotgfs_handle_rxflvl();
+        st_usbotgfs_handle_rxflvl();
     }
 
     if ((gintsts & USB_GINTSTS_IEPINT) != 0UL) {
-        usbotgfs_handle_iepint();
+        st_usbotgfs_handle_iepint();
         clear_mask |= USB_GINTSTS_IEPINT;
     }
 
     if ((gintsts & USB_GINTSTS_OEPINT) != 0UL) {
-        usbotgfs_handle_oepint();
+        st_usbotgfs_handle_oepint();
         clear_mask |= USB_GINTSTS_OEPINT;
     }
 
@@ -705,13 +759,13 @@ static int usbotgfs_isr(void *self, uint32_t IRQn)
     }
 
     if (clear_mask != 0UL) {
-        usbotgfs_write32(USB_GINTSTS_OFFSET, clear_mask);
+        st_usbotgfs_write32(USB_GINTSTS_OFFSET, clear_mask);
     }
 
     return 0;
 }
 
-int usbotgfs_probe(uint32_t label)
+static int st_usbotgfs_probe(uint32_t label)
 {
     if (merlin_platform_driver_register(&g_usbotgfs_driver, label) != STATUS_OK) {
         return -1;
@@ -719,14 +773,14 @@ int usbotgfs_probe(uint32_t label)
     return 0;
 }
 
-int usbotgfs_init(enum usb_otg_mode mode, enum usb_maximum_speed max_speed)
+static int st_usbotgfs_init(enum usb_otg_mode mode, enum usb_maximum_speed max_speed)
 {
     (void)max_speed;
 
     if (mode != USB_OTG_MODE_DEVICE) {
         return -1;
     }
-    if (!usbotgfs_is_ready()) {
+    if (!st_usbotgfs_is_ready()) {
         return -1;
     }
 
@@ -740,9 +794,9 @@ int usbotgfs_init(enum usb_otg_mode mode, enum usb_maximum_speed max_speed)
         g_mapped = true;
     }
 
-    usbotgfs_reset_runtime_state();
+    st_usbotgfs_reset_runtime_state();
 
-    if (usbotgfs_core_device_init() != 0) {
+    if (st_usbotgfs_core_device_init() != 0) {
         return -1;
     }
 
@@ -750,7 +804,7 @@ int usbotgfs_init(enum usb_otg_mode mode, enum usb_maximum_speed max_speed)
     return 0;
 }
 
-int usbotgfs_send_data(uint8_t *src, uint32_t size, uint8_t ep)
+static int st_usbotgfs_send_data(uint8_t *src, uint32_t size, uint8_t ep)
 {
     uint32_t pktcnt;
     uint32_t xfrsize;
@@ -764,27 +818,27 @@ int usbotgfs_send_data(uint8_t *src, uint32_t size, uint8_t ep)
     }
 
     if (size == 0U) {
-        return usbotgfs_send_zlp(ep);
+        return st_usbotgfs_send_zlp(ep);
     }
 
-    mps = usbotgfs_ep_get_mps(ep, USBOTG_FS_EP_DIR_IN);
+    mps = st_usbotgfs_ep_get_mps(ep, USBOTG_FS_EP_DIR_IN);
     pktcnt = (size + (uint32_t)mps - 1U) / (uint32_t)mps;
     xfrsize = size & USB_DXEPTSIZ_XFRSIZ_MASK;
 
     dieptsiz = xfrsize | ((pktcnt << USB_DXEPTSIZ_PKTCNT_SHIFT) & USB_DXEPTSIZ_PKTCNT_MASK);
-    usbotgfs_write32(usbotgfs_diep_offset(ep, USB_DIEPTSIZ_OFFSET), dieptsiz);
+    st_usbotgfs_write32(st_usbotgfs_diep_offset(ep, USB_DIEPTSIZ_OFFSET), dieptsiz);
 
-    txfsts = usbotgfs_read32(usbotgfs_diep_offset(ep, USB_DTXFSTS_OFFSET)) & 0xFFFFUL;
+    txfsts = st_usbotgfs_read32(st_usbotgfs_diep_offset(ep, USB_DTXFSTS_OFFSET)) & 0xFFFFUL;
     if (txfsts < ((size + 3U) / 4U)) {
         return -1;
     }
 
-    usbotgfs_fifo_write(ep, src, size);
+    st_usbotgfs_fifo_write(ep, src, size);
 
-    diepctl = usbotgfs_read32(usbotgfs_diep_offset(ep, USB_DIEPCTL_OFFSET));
+    diepctl = st_usbotgfs_read32(st_usbotgfs_diep_offset(ep, USB_DIEPCTL_OFFSET));
     diepctl |= USB_DXEPCTL_CNAK | USB_DXEPCTL_EPENA;
     diepctl &= ~USB_DXEPCTL_EPDIS;
-    usbotgfs_write32(usbotgfs_diep_offset(ep, USB_DIEPCTL_OFFSET), diepctl);
+    st_usbotgfs_write32(st_usbotgfs_diep_offset(ep, USB_DIEPCTL_OFFSET), diepctl);
 
     g_ep_last_tx_size[ep] = size;
     g_ep_state[ep][USBOTGFS_DIR_IN_IDX] = USBOTG_FS_EP_STATE_DATA_IN_WIP;
@@ -792,7 +846,7 @@ int usbotgfs_send_data(uint8_t *src, uint32_t size, uint8_t ep)
     return 0;
 }
 
-int usbotgfs_set_recv_fifo(uint8_t *dst, uint32_t size, uint8_t ep)
+static int st_usbotgfs_set_recv_fifo(uint8_t *dst, uint32_t size, uint8_t ep)
 {
     uint32_t pktcnt;
     uint32_t doeptsiz;
@@ -811,7 +865,7 @@ int usbotgfs_set_recv_fifo(uint8_t *dst, uint32_t size, uint8_t ep)
     g_ep_rx[ep].expected = size;
     g_ep_rx[ep].received = 0U;
 
-    mps = usbotgfs_ep_get_mps(ep, USBOTG_FS_EP_DIR_OUT);
+    mps = st_usbotgfs_ep_get_mps(ep, USBOTG_FS_EP_DIR_OUT);
     pktcnt = (size == 0U) ? 1U : ((size + (uint32_t)mps - 1U) / (uint32_t)mps);
     doeptsiz = (size & USB_DXEPTSIZ_XFRSIZ_MASK) |
                ((pktcnt << USB_DXEPTSIZ_PKTCNT_SHIFT) & USB_DXEPTSIZ_PKTCNT_MASK);
@@ -820,19 +874,19 @@ int usbotgfs_set_recv_fifo(uint8_t *dst, uint32_t size, uint8_t ep)
         doeptsiz |= USB_DOEPTSIZ0_STUPCNT_3;
     }
 
-    usbotgfs_write32(usbotgfs_doep_offset(ep, USB_DOEPTSIZ_OFFSET), doeptsiz);
+    st_usbotgfs_write32(st_usbotgfs_doep_offset(ep, USB_DOEPTSIZ_OFFSET), doeptsiz);
 
-    doepctl = usbotgfs_read32(usbotgfs_doep_offset(ep, USB_DOEPCTL_OFFSET));
+    doepctl = st_usbotgfs_read32(st_usbotgfs_doep_offset(ep, USB_DOEPCTL_OFFSET));
     doepctl |= USB_DXEPCTL_CNAK | USB_DXEPCTL_EPENA;
     doepctl &= ~USB_DXEPCTL_EPDIS;
-    usbotgfs_write32(usbotgfs_doep_offset(ep, USB_DOEPCTL_OFFSET), doepctl);
+    st_usbotgfs_write32(st_usbotgfs_doep_offset(ep, USB_DOEPCTL_OFFSET), doepctl);
 
     g_ep_state[ep][USBOTGFS_DIR_OUT_IDX] = USBOTG_FS_EP_STATE_DATA_OUT_WIP;
 
     return 0;
 }
 
-int usbotgfs_send_zlp(uint8_t ep)
+static int st_usbotgfs_send_zlp(uint8_t ep)
 {
     uint32_t dieptsiz;
     uint32_t diepctl;
@@ -842,12 +896,12 @@ int usbotgfs_send_zlp(uint8_t ep)
     }
 
     dieptsiz = (1UL << USB_DXEPTSIZ_PKTCNT_SHIFT);
-    usbotgfs_write32(usbotgfs_diep_offset(ep, USB_DIEPTSIZ_OFFSET), dieptsiz);
+    st_usbotgfs_write32(st_usbotgfs_diep_offset(ep, USB_DIEPTSIZ_OFFSET), dieptsiz);
 
-    diepctl = usbotgfs_read32(usbotgfs_diep_offset(ep, USB_DIEPCTL_OFFSET));
+    diepctl = st_usbotgfs_read32(st_usbotgfs_diep_offset(ep, USB_DIEPCTL_OFFSET));
     diepctl |= USB_DXEPCTL_CNAK | USB_DXEPCTL_EPENA;
     diepctl &= ~USB_DXEPCTL_EPDIS;
-    usbotgfs_write32(usbotgfs_diep_offset(ep, USB_DIEPCTL_OFFSET), diepctl);
+    st_usbotgfs_write32(st_usbotgfs_diep_offset(ep, USB_DIEPCTL_OFFSET), diepctl);
 
     g_ep_last_tx_size[ep] = 0U;
     g_ep_state[ep][USBOTGFS_DIR_IN_IDX] = USBOTG_FS_EP_STATE_STATUS;
@@ -855,7 +909,7 @@ int usbotgfs_send_zlp(uint8_t ep)
     return 0;
 }
 
-int usbotgfs_global_stall(void)
+static int st_usbotgfs_global_stall(void)
 {
     uint32_t dctl;
 
@@ -863,15 +917,15 @@ int usbotgfs_global_stall(void)
         return -1;
     }
 
-    dctl = usbotgfs_read32(USB_DCTL_OFFSET);
+    dctl = st_usbotgfs_read32(USB_DCTL_OFFSET);
     dctl |= USB_DCTL_SGINAK | USB_DCTL_SGONAK;
-    usbotgfs_write32(USB_DCTL_OFFSET, dctl);
+    st_usbotgfs_write32(USB_DCTL_OFFSET, dctl);
     g_global_stall = true;
 
     return 0;
 }
 
-int usbotgfs_global_stall_clear(void)
+static int st_usbotgfs_global_stall_clear(void)
 {
     uint32_t dctl;
 
@@ -879,15 +933,15 @@ int usbotgfs_global_stall_clear(void)
         return -1;
     }
 
-    dctl = usbotgfs_read32(USB_DCTL_OFFSET);
+    dctl = st_usbotgfs_read32(USB_DCTL_OFFSET);
     dctl |= USB_DCTL_CGINAK | USB_DCTL_CGONAK;
-    usbotgfs_write32(USB_DCTL_OFFSET, dctl);
+    st_usbotgfs_write32(USB_DCTL_OFFSET, dctl);
     g_global_stall = false;
 
     return 0;
 }
 
-static int usbotgfs_endpoint_modify_stall(uint8_t ep, usbotgfs_ep_dir_t dir, bool stall)
+static int st_usbotgfs_endpoint_modify_stall(uint8_t ep, st_usbotgfs_ep_dir_t dir, bool stall)
 {
     uint32_t reg;
 
@@ -896,7 +950,7 @@ static int usbotgfs_endpoint_modify_stall(uint8_t ep, usbotgfs_ep_dir_t dir, boo
     }
 
     if (dir == USBOTG_FS_EP_DIR_IN || dir == USBOTG_FS_EP_DIR_BOTH) {
-        reg = usbotgfs_read32(usbotgfs_diep_offset(ep, USB_DIEPCTL_OFFSET));
+        reg = st_usbotgfs_read32(st_usbotgfs_diep_offset(ep, USB_DIEPCTL_OFFSET));
         if (stall) {
             reg |= USB_DXEPCTL_STALL;
             g_ep_state[ep][USBOTGFS_DIR_IN_IDX] = USBOTG_FS_EP_STATE_STALL;
@@ -904,11 +958,11 @@ static int usbotgfs_endpoint_modify_stall(uint8_t ep, usbotgfs_ep_dir_t dir, boo
             reg &= ~USB_DXEPCTL_STALL;
             g_ep_state[ep][USBOTGFS_DIR_IN_IDX] = USBOTG_FS_EP_STATE_IDLE;
         }
-        usbotgfs_write32(usbotgfs_diep_offset(ep, USB_DIEPCTL_OFFSET), reg);
+        st_usbotgfs_write32(st_usbotgfs_diep_offset(ep, USB_DIEPCTL_OFFSET), reg);
     }
 
     if (dir == USBOTG_FS_EP_DIR_OUT || dir == USBOTG_FS_EP_DIR_BOTH) {
-        reg = usbotgfs_read32(usbotgfs_doep_offset(ep, USB_DOEPCTL_OFFSET));
+        reg = st_usbotgfs_read32(st_usbotgfs_doep_offset(ep, USB_DOEPCTL_OFFSET));
         if (stall) {
             reg |= USB_DXEPCTL_STALL;
             g_ep_state[ep][USBOTGFS_DIR_OUT_IDX] = USBOTG_FS_EP_STATE_STALL;
@@ -916,23 +970,23 @@ static int usbotgfs_endpoint_modify_stall(uint8_t ep, usbotgfs_ep_dir_t dir, boo
             reg &= ~USB_DXEPCTL_STALL;
             g_ep_state[ep][USBOTGFS_DIR_OUT_IDX] = USBOTG_FS_EP_STATE_IDLE;
         }
-        usbotgfs_write32(usbotgfs_doep_offset(ep, USB_DOEPCTL_OFFSET), reg);
+        st_usbotgfs_write32(st_usbotgfs_doep_offset(ep, USB_DOEPCTL_OFFSET), reg);
     }
 
     return 0;
 }
 
-int usbotgfs_endpoint_stall(uint8_t ep, usbotgfs_ep_dir_t dir)
+static int st_usbotgfs_endpoint_stall(uint8_t ep, st_usbotgfs_ep_dir_t dir)
 {
-    return usbotgfs_endpoint_modify_stall(ep, dir, true);
+    return st_usbotgfs_endpoint_modify_stall(ep, dir, true);
 }
 
-int usbotgfs_endpoint_stall_clear(uint8_t ep, usbotgfs_ep_dir_t dir)
+static int st_usbotgfs_endpoint_stall_clear(uint8_t ep, st_usbotgfs_ep_dir_t dir)
 {
-    return usbotgfs_endpoint_modify_stall(ep, dir, false);
+    return st_usbotgfs_endpoint_modify_stall(ep, dir, false);
 }
 
-int usbotgfs_endpoint_set_nak(uint8_t ep, usbotgfs_ep_dir_t dir)
+static int st_usbotgfs_endpoint_set_nak(uint8_t ep, st_usbotgfs_ep_dir_t dir)
 {
     uint32_t reg;
 
@@ -941,21 +995,21 @@ int usbotgfs_endpoint_set_nak(uint8_t ep, usbotgfs_ep_dir_t dir)
     }
 
     if (dir == USBOTG_FS_EP_DIR_IN || dir == USBOTG_FS_EP_DIR_BOTH) {
-        reg = usbotgfs_read32(usbotgfs_diep_offset(ep, USB_DIEPCTL_OFFSET));
+        reg = st_usbotgfs_read32(st_usbotgfs_diep_offset(ep, USB_DIEPCTL_OFFSET));
         reg |= USB_DXEPCTL_SNAK;
-        usbotgfs_write32(usbotgfs_diep_offset(ep, USB_DIEPCTL_OFFSET), reg);
+        st_usbotgfs_write32(st_usbotgfs_diep_offset(ep, USB_DIEPCTL_OFFSET), reg);
     }
 
     if (dir == USBOTG_FS_EP_DIR_OUT || dir == USBOTG_FS_EP_DIR_BOTH) {
-        reg = usbotgfs_read32(usbotgfs_doep_offset(ep, USB_DOEPCTL_OFFSET));
+        reg = st_usbotgfs_read32(st_usbotgfs_doep_offset(ep, USB_DOEPCTL_OFFSET));
         reg |= USB_DXEPCTL_SNAK;
-        usbotgfs_write32(usbotgfs_doep_offset(ep, USB_DOEPCTL_OFFSET), reg);
+        st_usbotgfs_write32(st_usbotgfs_doep_offset(ep, USB_DOEPCTL_OFFSET), reg);
     }
 
     return 0;
 }
 
-int usbotgfs_endpoint_clear_nak(uint8_t ep, usbotgfs_ep_dir_t dir)
+static int st_usbotgfs_endpoint_clear_nak(uint8_t ep, st_usbotgfs_ep_dir_t dir)
 {
     uint32_t reg;
 
@@ -964,26 +1018,26 @@ int usbotgfs_endpoint_clear_nak(uint8_t ep, usbotgfs_ep_dir_t dir)
     }
 
     if (dir == USBOTG_FS_EP_DIR_IN || dir == USBOTG_FS_EP_DIR_BOTH) {
-        reg = usbotgfs_read32(usbotgfs_diep_offset(ep, USB_DIEPCTL_OFFSET));
+        reg = st_usbotgfs_read32(st_usbotgfs_diep_offset(ep, USB_DIEPCTL_OFFSET));
         reg |= USB_DXEPCTL_CNAK;
-        usbotgfs_write32(usbotgfs_diep_offset(ep, USB_DIEPCTL_OFFSET), reg);
+        st_usbotgfs_write32(st_usbotgfs_diep_offset(ep, USB_DIEPCTL_OFFSET), reg);
     }
 
     if (dir == USBOTG_FS_EP_DIR_OUT || dir == USBOTG_FS_EP_DIR_BOTH) {
-        reg = usbotgfs_read32(usbotgfs_doep_offset(ep, USB_DOEPCTL_OFFSET));
+        reg = st_usbotgfs_read32(st_usbotgfs_doep_offset(ep, USB_DOEPCTL_OFFSET));
         reg |= USB_DXEPCTL_CNAK;
-        usbotgfs_write32(usbotgfs_doep_offset(ep, USB_DOEPCTL_OFFSET), reg);
+        st_usbotgfs_write32(st_usbotgfs_doep_offset(ep, USB_DOEPCTL_OFFSET), reg);
     }
 
     return 0;
 }
 
-static int usbotgfs_configure_one_ep(uint8_t ep,
-                                     usbotgfs_ep_type_t type,
-                                     usbotgfs_ep_dir_t dir,
-                                     usbotgfs_epx_mpsize_t mpsize,
-                                     usbotgfs_ep_toggle_t dtoggle,
-                                     usbotgfs_ioep_handler_t handler)
+static int st_usbotgfs_configure_one_ep(uint8_t ep,
+                                     st_usbotgfs_ep_type_t type,
+                                     st_usbotgfs_ep_dir_t dir,
+                                     st_usbotgfs_epx_mpsize_t mpsize,
+                                     st_usbotgfs_ep_toggle_t dtoggle,
+                                     st_usbotgfs_ioep_handler_t handler)
 {
     const bool in_dir = (dir == USBOTG_FS_EP_DIR_IN);
     uint32_t reg;
@@ -994,15 +1048,15 @@ static int usbotgfs_configure_one_ep(uint8_t ep,
         return -1;
     }
 
-    idx = usbotgfs_dir_to_index(dir);
+    idx = st_usbotgfs_dir_to_index(dir);
     if (idx < 0) {
         return -1;
     }
 
-    ctl_off = in_dir ? usbotgfs_diep_offset(ep, USB_DIEPCTL_OFFSET)
-                     : usbotgfs_doep_offset(ep, USB_DOEPCTL_OFFSET);
+    ctl_off = in_dir ? st_usbotgfs_diep_offset(ep, USB_DIEPCTL_OFFSET)
+                     : st_usbotgfs_doep_offset(ep, USB_DOEPCTL_OFFSET);
 
-    reg = usbotgfs_read32(ctl_off);
+    reg = st_usbotgfs_read32(ctl_off);
     reg &= ~(USB_DXEPCTL_MPSIZ_MASK |
              USB_DXEPCTL_EPTYP_MASK |
              USB_DXEPCTL_TXFNUM_MASK |
@@ -1013,7 +1067,7 @@ static int usbotgfs_configure_one_ep(uint8_t ep,
              USB_DXEPCTL_EPENA);
 
     if (ep == 0U) {
-        reg |= usbotgfs_ep0_mps_to_field((uint16_t)mpsize);
+        reg |= st_usbotgfs_ep0_mps_to_field((uint16_t)mpsize);
     } else {
         reg |= ((uint32_t)mpsize & USB_DXEPCTL_MPSIZ_MASK);
         reg |= (((uint32_t)type << USB_DXEPCTL_EPTYP_SHIFT) & USB_DXEPCTL_EPTYP_MASK);
@@ -1029,7 +1083,7 @@ static int usbotgfs_configure_one_ep(uint8_t ep,
     }
 
     reg |= USB_DXEPCTL_USBAEP;
-    usbotgfs_write32(ctl_off, reg);
+    st_usbotgfs_write32(ctl_off, reg);
 
     g_ep_mpsize[ep][idx] = mpsize;
     g_ep_type[ep][idx] = type;
@@ -1039,34 +1093,34 @@ static int usbotgfs_configure_one_ep(uint8_t ep,
     return 0;
 }
 
-int usbotgfs_configure_endpoint(uint8_t ep,
-                                usbotgfs_ep_type_t type,
-                                usbotgfs_ep_dir_t dir,
-                                usbotgfs_epx_mpsize_t mpsize,
-                                usbotgfs_ep_toggle_t dtoggle,
-                                usbotgfs_ioep_handler_t handler)
+static int st_usbotgfs_configure_endpoint(uint8_t ep,
+                                st_usbotgfs_ep_type_t type,
+                                st_usbotgfs_ep_dir_t dir,
+                                st_usbotgfs_epx_mpsize_t mpsize,
+                                st_usbotgfs_ep_toggle_t dtoggle,
+                                st_usbotgfs_ioep_handler_t handler)
 {
     if (!g_initialized) {
         return -1;
     }
 
     if (dir == USBOTG_FS_EP_DIR_BOTH) {
-        if (usbotgfs_configure_one_ep(ep, type, USBOTG_FS_EP_DIR_IN, mpsize, dtoggle, handler) != 0) {
+        if (st_usbotgfs_configure_one_ep(ep, type, USBOTG_FS_EP_DIR_IN, mpsize, dtoggle, handler) != 0) {
             return -1;
         }
-        return usbotgfs_configure_one_ep(ep, type, USBOTG_FS_EP_DIR_OUT, mpsize, dtoggle, handler);
+        return st_usbotgfs_configure_one_ep(ep, type, USBOTG_FS_EP_DIR_OUT, mpsize, dtoggle, handler);
     }
 
-    return usbotgfs_configure_one_ep(ep, type, dir, mpsize, dtoggle, handler);
+    return st_usbotgfs_configure_one_ep(ep, type, dir, mpsize, dtoggle, handler);
 }
 
-int usbotgfs_deconfigure_endpoint(uint8_t ep)
+static int st_usbotgfs_deconfigure_endpoint(uint8_t ep)
 {
     if (!g_initialized || ep >= USBOTGFS_NUM_EPS) {
         return -1;
     }
 
-    (void)usbotgfs_deactivate_endpoint(ep, USBOTG_FS_EP_DIR_BOTH);
+    (void)st_usbotgfs_deactivate_endpoint(ep, USBOTG_FS_EP_DIR_BOTH);
     g_ep_handler[ep][USBOTGFS_DIR_IN_IDX] = NULL;
     g_ep_handler[ep][USBOTGFS_DIR_OUT_IDX] = NULL;
     g_ep_state[ep][USBOTGFS_DIR_IN_IDX] = USBOTG_FS_EP_STATE_IDLE;
@@ -1075,7 +1129,7 @@ int usbotgfs_deconfigure_endpoint(uint8_t ep)
     return 0;
 }
 
-int usbotgfs_activate_endpoint(uint8_t ep, usbotgfs_ep_dir_t dir)
+static int st_usbotgfs_activate_endpoint(uint8_t ep, st_usbotgfs_ep_dir_t dir)
 {
     uint32_t reg;
 
@@ -1084,23 +1138,23 @@ int usbotgfs_activate_endpoint(uint8_t ep, usbotgfs_ep_dir_t dir)
     }
 
     if (dir == USBOTG_FS_EP_DIR_IN || dir == USBOTG_FS_EP_DIR_BOTH) {
-        reg = usbotgfs_read32(usbotgfs_diep_offset(ep, USB_DIEPCTL_OFFSET));
+        reg = st_usbotgfs_read32(st_usbotgfs_diep_offset(ep, USB_DIEPCTL_OFFSET));
         reg |= USB_DXEPCTL_USBAEP | USB_DXEPCTL_CNAK | USB_DXEPCTL_EPENA;
         reg &= ~USB_DXEPCTL_EPDIS;
-        usbotgfs_write32(usbotgfs_diep_offset(ep, USB_DIEPCTL_OFFSET), reg);
+        st_usbotgfs_write32(st_usbotgfs_diep_offset(ep, USB_DIEPCTL_OFFSET), reg);
     }
 
     if (dir == USBOTG_FS_EP_DIR_OUT || dir == USBOTG_FS_EP_DIR_BOTH) {
-        reg = usbotgfs_read32(usbotgfs_doep_offset(ep, USB_DOEPCTL_OFFSET));
+        reg = st_usbotgfs_read32(st_usbotgfs_doep_offset(ep, USB_DOEPCTL_OFFSET));
         reg |= USB_DXEPCTL_USBAEP | USB_DXEPCTL_CNAK | USB_DXEPCTL_EPENA;
         reg &= ~USB_DXEPCTL_EPDIS;
-        usbotgfs_write32(usbotgfs_doep_offset(ep, USB_DOEPCTL_OFFSET), reg);
+        st_usbotgfs_write32(st_usbotgfs_doep_offset(ep, USB_DOEPCTL_OFFSET), reg);
     }
 
     return 0;
 }
 
-int usbotgfs_deactivate_endpoint(uint8_t ep, usbotgfs_ep_dir_t dir)
+static int st_usbotgfs_deactivate_endpoint(uint8_t ep, st_usbotgfs_ep_dir_t dir)
 {
     uint32_t reg;
 
@@ -1109,25 +1163,25 @@ int usbotgfs_deactivate_endpoint(uint8_t ep, usbotgfs_ep_dir_t dir)
     }
 
     if (dir == USBOTG_FS_EP_DIR_IN || dir == USBOTG_FS_EP_DIR_BOTH) {
-        reg = usbotgfs_read32(usbotgfs_diep_offset(ep, USB_DIEPCTL_OFFSET));
+        reg = st_usbotgfs_read32(st_usbotgfs_diep_offset(ep, USB_DIEPCTL_OFFSET));
         reg |= USB_DXEPCTL_SNAK | USB_DXEPCTL_EPDIS;
         reg &= ~USB_DXEPCTL_EPENA;
-        usbotgfs_write32(usbotgfs_diep_offset(ep, USB_DIEPCTL_OFFSET), reg);
+        st_usbotgfs_write32(st_usbotgfs_diep_offset(ep, USB_DIEPCTL_OFFSET), reg);
         g_ep_state[ep][USBOTGFS_DIR_IN_IDX] = USBOTG_FS_EP_STATE_IDLE;
     }
 
     if (dir == USBOTG_FS_EP_DIR_OUT || dir == USBOTG_FS_EP_DIR_BOTH) {
-        reg = usbotgfs_read32(usbotgfs_doep_offset(ep, USB_DOEPCTL_OFFSET));
+        reg = st_usbotgfs_read32(st_usbotgfs_doep_offset(ep, USB_DOEPCTL_OFFSET));
         reg |= USB_DXEPCTL_SNAK | USB_DXEPCTL_EPDIS;
         reg &= ~USB_DXEPCTL_EPENA;
-        usbotgfs_write32(usbotgfs_doep_offset(ep, USB_DOEPCTL_OFFSET), reg);
+        st_usbotgfs_write32(st_usbotgfs_doep_offset(ep, USB_DOEPCTL_OFFSET), reg);
         g_ep_state[ep][USBOTGFS_DIR_OUT_IDX] = USBOTG_FS_EP_STATE_IDLE;
     }
 
     return 0;
 }
 
-void usbotgfs_set_address(uint16_t addr)
+static void st_usbotgfs_set_address(uint16_t addr)
 {
     uint32_t dcfg;
 
@@ -1135,15 +1189,15 @@ void usbotgfs_set_address(uint16_t addr)
         return;
     }
 
-    dcfg = usbotgfs_read32(USB_DCFG_OFFSET);
+    dcfg = st_usbotgfs_read32(USB_DCFG_OFFSET);
     dcfg &= ~USB_DCFG_DAD_MASK;
     dcfg |= (((uint32_t)addr & 0x7FUL) << USB_DCFG_DAD_SHIFT);
-    usbotgfs_write32(USB_DCFG_OFFSET, dcfg);
+    st_usbotgfs_write32(USB_DCFG_OFFSET, dcfg);
 }
 
-usbotgfs_ep_state_t usbotgfs_get_ep_state(uint8_t epnum, usbotgfs_ep_dir_t dir)
+static st_usbotgfs_ep_state_t st_usbotgfs_get_ep_state(uint8_t epnum, st_usbotgfs_ep_dir_t dir)
 {
-    const int idx = usbotgfs_dir_to_index(dir);
+    const int idx = st_usbotgfs_dir_to_index(dir);
 
     if (epnum >= USBOTGFS_NUM_EPS || idx < 0) {
         return USBOTG_FS_EP_STATE_INVALID;
@@ -1152,7 +1206,7 @@ usbotgfs_ep_state_t usbotgfs_get_ep_state(uint8_t epnum, usbotgfs_ep_dir_t dir)
     return g_ep_state[epnum][idx];
 }
 
-uint16_t usbotgfs_get_ep_mpsize(usbotgfs_ep_type_t type)
+static uint16_t st_usbotgfs_get_ep_mpsize(st_usbotgfs_ep_type_t type)
 {
     switch (type) {
         case USBOTG_FS_EP_TYPE_ISOCHRONOUS:
@@ -1165,10 +1219,517 @@ uint16_t usbotgfs_get_ep_mpsize(usbotgfs_ep_type_t type)
     }
 }
 
-usbotgfs_port_speed_t usbotgfs_get_speed(void)
+static st_usbotgfs_port_speed_t st_usbotgfs_get_speed(void)
 {
     if (g_initialized) {
-        usbotgfs_update_port_speed();
+        st_usbotgfs_update_port_speed();
     }
     return g_port_speed;
 }
+
+static drv_status_t usb_require_registered(uint32_t label)
+{
+    if (g_usbotgfs_driver.devinfo == NULL || g_usbotgfs_driver.label != label) {
+        return DRV_ERROR_NOTREGISTERED;
+    }
+
+    return DRV_STATUS_OK;
+}
+
+/**
+ * @brief Register USB OTG FS controller metadata in Merlin.
+ */
+static drv_status_t st_usbotgfs_usb_probe(uint32_t label)
+{
+    if (g_usbotgfs_driver.devinfo != NULL) {
+        return DRV_ERROR_INVSTATE;
+    }
+
+    return (st_usbotgfs_probe(label) == 0) ? DRV_STATUS_OK : DRV_ERROR_NOTREGISTERED;
+}
+
+/**
+ * @brief Initialize the probed USB OTG FS controller.
+ */
+static drv_status_t st_usbotgfs_usb_init(uint32_t label, enum usb_otg_mode mode, enum usb_maximum_speed max_speed)
+{
+    drv_status_t status;
+
+    status = usb_require_registered(label);
+    if (status != DRV_STATUS_OK) {
+        return status;
+    }
+    if (g_initialized) {
+        return DRV_ERROR_INVSTATE;
+    }
+    if (mode != USB_OTG_MODE_DEVICE) {
+        return DRV_ERROR_UNSUPPORTED_CFG;
+    }
+    if (max_speed != USB_MAXIMUM_SPEED_FULL) {
+        return DRV_ERROR_UNSUPPORTED_CFG;
+    }
+
+    return (st_usbotgfs_init(mode, max_speed) == 0) ? DRV_STATUS_OK : DRV_ERROR_CONFIGURATION;
+}
+
+/**
+ * @brief Release and unmap the USB OTG FS controller.
+ */
+static drv_status_t st_usbotgfs_usb_release(uint32_t label)
+{
+    drv_status_t status;
+
+    status = usb_require_registered(label);
+    if (status != DRV_STATUS_OK) {
+        return status;
+    }
+
+    if (g_mapped) {
+        if (merlin_platform_driver_unmap(&g_usbotgfs_driver) != STATUS_OK) {
+            return DRV_ERROR_CONFIGURATION;
+        }
+    }
+
+    g_initialized = false;
+    g_mapped = false;
+    g_global_stall = false;
+    g_port_speed = USBOTG_FS_PORT_SPEED_UNKNOWN;
+    g_usbotgfs_driver.devh = 0;
+    g_usbotgfs_driver.devinfo = NULL;
+    g_usbotgfs_driver.label = 0;
+    st_usbotgfs_reset_runtime_state();
+
+    return DRV_STATUS_OK;
+}
+
+/**
+ * @brief Queue data to an IN endpoint FIFO.
+ */
+static drv_status_t st_usbotgfs_usb_send_data(uint32_t label, uint8_t *src, uint32_t size, uint8_t ep)
+{
+    drv_status_t status;
+
+    status = usb_require_registered(label);
+    if (status != DRV_STATUS_OK) {
+        return status;
+    }
+    if (!g_initialized) {
+        return DRV_ERROR_INVSTATE;
+    }
+    if ((src == NULL && size != 0U) || (ep >= USBOTGFS_NUM_EPS)) {
+        return DRV_ERROR_INVPARAM;
+    }
+
+    return (st_usbotgfs_send_data(src, size, ep) == 0) ? DRV_STATUS_OK : DRV_ERROR_AGAIN;
+}
+
+/**
+ * @brief Arm an OUT endpoint with a destination buffer.
+ */
+static drv_status_t st_usbotgfs_usb_set_recv_fifo(uint32_t label, uint8_t *dst, uint32_t size, uint8_t ep)
+{
+    drv_status_t status;
+
+    status = usb_require_registered(label);
+    if (status != DRV_STATUS_OK) {
+        return status;
+    }
+    if (!g_initialized) {
+        return DRV_ERROR_INVSTATE;
+    }
+    if ((dst == NULL && size != 0U) || (size > USB_DXEPTSIZ_XFRSIZ_MASK) || (ep >= USBOTGFS_NUM_EPS)) {
+        return DRV_ERROR_INVPARAM;
+    }
+
+    return (st_usbotgfs_set_recv_fifo(dst, size, ep) == 0) ? DRV_STATUS_OK : DRV_ERROR_CONFIGURATION;
+}
+
+/**
+ * @brief Transmit a zero-length packet on an endpoint.
+ */
+static drv_status_t st_usbotgfs_usb_send_zlp(uint32_t label, uint8_t ep)
+{
+    drv_status_t status;
+
+    status = usb_require_registered(label);
+    if (status != DRV_STATUS_OK) {
+        return status;
+    }
+    if (!g_initialized) {
+        return DRV_ERROR_INVSTATE;
+    }
+    if (ep >= USBOTGFS_NUM_EPS) {
+        return DRV_ERROR_INVPARAM;
+    }
+
+    return (st_usbotgfs_send_zlp(ep) == 0) ? DRV_STATUS_OK : DRV_ERROR_CONFIGURATION;
+}
+
+/**
+ * @brief Enable global NAK/stall handling at device level.
+ */
+static drv_status_t st_usbotgfs_usb_global_stall(uint32_t label)
+{
+    drv_status_t status;
+
+    status = usb_require_registered(label);
+    if (status != DRV_STATUS_OK) {
+        return status;
+    }
+    if (!g_initialized) {
+        return DRV_ERROR_INVSTATE;
+    }
+
+    return (st_usbotgfs_global_stall() == 0) ? DRV_STATUS_OK : DRV_ERROR_CONFIGURATION;
+}
+
+/**
+ * @brief Disable global NAK/stall handling at device level.
+ */
+static drv_status_t st_usbotgfs_usb_global_stall_clear(uint32_t label)
+{
+    drv_status_t status;
+
+    status = usb_require_registered(label);
+    if (status != DRV_STATUS_OK) {
+        return status;
+    }
+    if (!g_initialized) {
+        return DRV_ERROR_INVSTATE;
+    }
+
+    return (st_usbotgfs_global_stall_clear() == 0) ? DRV_STATUS_OK : DRV_ERROR_CONFIGURATION;
+}
+
+/**
+ * @brief Set STALL on a specific endpoint direction.
+ */
+static drv_status_t st_usbotgfs_usb_endpoint_stall(uint32_t label, uint8_t ep_id, enum usb_endpoint_direction dir)
+{
+    drv_status_t status;
+
+    status = usb_require_registered(label);
+    if (status != DRV_STATUS_OK) {
+        return status;
+    }
+    if (!g_initialized) {
+        return DRV_ERROR_INVSTATE;
+    }
+    if (ep_id >= USBOTGFS_NUM_EPS || dir == USB_ENDPOINT_DIR_UNKNOWN) {
+        return DRV_ERROR_INVPARAM;
+    }
+
+    return (st_usbotgfs_endpoint_stall(ep_id, (st_usbotgfs_ep_dir_t)dir) == 0) ? DRV_STATUS_OK : DRV_ERROR_CONFIGURATION;
+}
+
+/**
+ * @brief Clear STALL on a specific endpoint direction.
+ */
+static drv_status_t st_usbotgfs_usb_endpoint_stall_clear(uint32_t label, uint8_t ep_id, enum usb_endpoint_direction dir)
+{
+    drv_status_t status;
+
+    status = usb_require_registered(label);
+    if (status != DRV_STATUS_OK) {
+        return status;
+    }
+    if (!g_initialized) {
+        return DRV_ERROR_INVSTATE;
+    }
+    if (ep_id >= USBOTGFS_NUM_EPS || dir == USB_ENDPOINT_DIR_UNKNOWN) {
+        return DRV_ERROR_INVPARAM;
+    }
+
+    return (st_usbotgfs_endpoint_stall_clear(ep_id, (st_usbotgfs_ep_dir_t)dir) == 0) ? DRV_STATUS_OK : DRV_ERROR_CONFIGURATION;
+}
+
+/**
+ * @brief Set NAK on a specific endpoint direction.
+ */
+static drv_status_t st_usbotgfs_usb_endpoint_set_nak(uint32_t label, uint8_t ep_id, enum usb_endpoint_direction dir)
+{
+    drv_status_t status;
+
+    status = usb_require_registered(label);
+    if (status != DRV_STATUS_OK) {
+        return status;
+    }
+    if (!g_initialized) {
+        return DRV_ERROR_INVSTATE;
+    }
+    if (ep_id >= USBOTGFS_NUM_EPS || dir == USB_ENDPOINT_DIR_UNKNOWN) {
+        return DRV_ERROR_INVPARAM;
+    }
+
+    return (st_usbotgfs_endpoint_set_nak(ep_id, (st_usbotgfs_ep_dir_t)dir) == 0) ? DRV_STATUS_OK : DRV_ERROR_CONFIGURATION;
+}
+
+/**
+ * @brief Clear NAK on a specific endpoint direction.
+ */
+static drv_status_t st_usbotgfs_usb_endpoint_clear_nak(uint32_t label, uint8_t ep_id, enum usb_endpoint_direction dir)
+{
+    drv_status_t status;
+
+    status = usb_require_registered(label);
+    if (status != DRV_STATUS_OK) {
+        return status;
+    }
+    if (!g_initialized) {
+        return DRV_ERROR_INVSTATE;
+    }
+    if (ep_id >= USBOTGFS_NUM_EPS || dir == USB_ENDPOINT_DIR_UNKNOWN) {
+        return DRV_ERROR_INVPARAM;
+    }
+
+    return (st_usbotgfs_endpoint_clear_nak(ep_id, (st_usbotgfs_ep_dir_t)dir) == 0) ? DRV_STATUS_OK : DRV_ERROR_CONFIGURATION;
+}
+
+/**
+ * @brief Configure endpoint capabilities and callback.
+ */
+static drv_status_t st_usbotgfs_usb_configure_endpoint(uint32_t label,
+                                    uint8_t ep,
+                                    enum usb_endpoint_type type,
+                                    enum usb_endpoint_direction dir,
+                                    enum usb_endpoint_mpsize mpsize,
+                                    enum usb_endpoint_toggle dtoggle,
+                                    usb_ioep_handler_t handler)
+{
+    drv_status_t status;
+
+    status = usb_require_registered(label);
+    if (status != DRV_STATUS_OK) {
+        return status;
+    }
+    if (!g_initialized) {
+        return DRV_ERROR_INVSTATE;
+    }
+    if (ep >= USBOTGFS_NUM_EPS || type == USB_ENDPOINT_TYPE_UNKNOWN || dir == USB_ENDPOINT_DIR_UNKNOWN) {
+        return DRV_ERROR_INVPARAM;
+    }
+    if (mpsize != USB_ENDPOINT_MPSIZE_64BYTES && mpsize != USB_ENDPOINT_MPSIZE_128BYTES &&
+        mpsize != USB_ENDPOINT_MPSIZE_512BYTES && mpsize != USB_ENDPOINT_MPSIZE_1024BYTES) {
+        return DRV_ERROR_UNSUPPORTED_CFG;
+    }
+
+    return (st_usbotgfs_configure_endpoint(ep,
+                                        (st_usbotgfs_ep_type_t)type,
+                                        (st_usbotgfs_ep_dir_t)dir,
+                                        (st_usbotgfs_epx_mpsize_t)mpsize,
+                                        (st_usbotgfs_ep_toggle_t)dtoggle,
+                                        handler) == 0) ? DRV_STATUS_OK : DRV_ERROR_CONFIGURATION;
+}
+
+/**
+ * @brief Deconfigure a previously configured endpoint.
+ */
+static drv_status_t st_usbotgfs_usb_deconfigure_endpoint(uint32_t label, uint8_t ep)
+{
+    drv_status_t status;
+
+    status = usb_require_registered(label);
+    if (status != DRV_STATUS_OK) {
+        return status;
+    }
+    if (!g_initialized) {
+        return DRV_ERROR_INVSTATE;
+    }
+    if (ep >= USBOTGFS_NUM_EPS) {
+        return DRV_ERROR_INVPARAM;
+    }
+
+    return (st_usbotgfs_deconfigure_endpoint(ep) == 0) ? DRV_STATUS_OK : DRV_ERROR_CONFIGURATION;
+}
+
+/**
+ * @brief Activate endpoint traffic.
+ */
+static drv_status_t st_usbotgfs_usb_activate_endpoint(uint32_t label, uint8_t ep, enum usb_endpoint_direction dir)
+{
+    drv_status_t status;
+
+    status = usb_require_registered(label);
+    if (status != DRV_STATUS_OK) {
+        return status;
+    }
+    if (!g_initialized) {
+        return DRV_ERROR_INVSTATE;
+    }
+    if (ep >= USBOTGFS_NUM_EPS || dir == USB_ENDPOINT_DIR_UNKNOWN) {
+        return DRV_ERROR_INVPARAM;
+    }
+
+    return (st_usbotgfs_activate_endpoint(ep, (st_usbotgfs_ep_dir_t)dir) == 0) ? DRV_STATUS_OK : DRV_ERROR_CONFIGURATION;
+}
+
+/**
+ * @brief Deactivate endpoint traffic.
+ */
+static drv_status_t st_usbotgfs_usb_deactivate_endpoint(uint32_t label, uint8_t ep, enum usb_endpoint_direction dir)
+{
+    drv_status_t status;
+
+    status = usb_require_registered(label);
+    if (status != DRV_STATUS_OK) {
+        return status;
+    }
+    if (!g_initialized) {
+        return DRV_ERROR_INVSTATE;
+    }
+    if (ep >= USBOTGFS_NUM_EPS || dir == USB_ENDPOINT_DIR_UNKNOWN) {
+        return DRV_ERROR_INVPARAM;
+    }
+
+    return (st_usbotgfs_deactivate_endpoint(ep, (st_usbotgfs_ep_dir_t)dir) == 0) ? DRV_STATUS_OK : DRV_ERROR_CONFIGURATION;
+}
+
+/**
+ * @brief Program USB device address in DCFG.
+ */
+static drv_status_t st_usbotgfs_usb_set_address(uint32_t label, uint16_t addr)
+{
+    drv_status_t status;
+
+    status = usb_require_registered(label);
+    if (status != DRV_STATUS_OK) {
+        return status;
+    }
+    if (!g_initialized) {
+        return DRV_ERROR_INVSTATE;
+    }
+    if (addr > 0x7FU) {
+        return DRV_ERROR_INVPARAM;
+    }
+
+    st_usbotgfs_set_address(addr);
+    return DRV_STATUS_OK;
+}
+
+/**
+ * @brief Read current endpoint runtime state.
+ */
+static drv_status_t st_usbotgfs_usb_get_ep_state(uint32_t label,
+                              uint8_t epnum,
+                              enum usb_endpoint_direction dir,
+                              enum usb_endpoint_state *state)
+{
+    drv_status_t status;
+
+    status = usb_require_registered(label);
+    if (status != DRV_STATUS_OK) {
+        return status;
+    }
+    if (!g_initialized) {
+        return DRV_ERROR_INVSTATE;
+    }
+    if (state == NULL || epnum >= USBOTGFS_NUM_EPS || dir == USB_ENDPOINT_DIR_UNKNOWN) {
+        return DRV_ERROR_INVPARAM;
+    }
+
+    *state = (enum usb_endpoint_state)st_usbotgfs_get_ep_state(epnum, (st_usbotgfs_ep_dir_t)dir);
+    return DRV_STATUS_OK;
+}
+
+/**
+ * @brief Return recommended MPS for an endpoint type.
+ */
+static drv_status_t st_usbotgfs_usb_get_ep_mpsize(uint32_t label, enum usb_endpoint_type type, uint16_t *mpsize)
+{
+    drv_status_t status;
+
+    status = usb_require_registered(label);
+    if (status != DRV_STATUS_OK) {
+        return status;
+    }
+    if (!g_initialized) {
+        return DRV_ERROR_INVSTATE;
+    }
+    if (mpsize == NULL || type == USB_ENDPOINT_TYPE_UNKNOWN) {
+        return DRV_ERROR_INVPARAM;
+    }
+
+    *mpsize = st_usbotgfs_get_ep_mpsize((st_usbotgfs_ep_type_t)type);
+    return DRV_STATUS_OK;
+}
+
+/**
+ * @brief Return current enumerated USB port speed.
+ */
+static drv_status_t st_usbotgfs_usb_get_speed(uint32_t label, enum usb_port_speed *speed)
+{
+    drv_status_t status;
+
+    status = usb_require_registered(label);
+    if (status != DRV_STATUS_OK) {
+        return status;
+    }
+    if (!g_initialized) {
+        return DRV_ERROR_INVSTATE;
+    }
+    if (speed == NULL) {
+        return DRV_ERROR_INVPARAM;
+    }
+
+    *speed = (enum usb_port_speed)st_usbotgfs_get_speed();
+    return DRV_STATUS_OK;
+}
+
+/*
+ * Export Merlin USB API symbols through aliases while keeping implementation
+ * symbols private and prefixed with st_usbotgfs_.
+ */
+drv_status_t usb_probe(uint32_t label) __attribute__((alias("st_usbotgfs_usb_probe")));
+drv_status_t usb_init(uint32_t label,
+                      enum usb_otg_mode mode,
+                      enum usb_maximum_speed max_speed) __attribute__((alias("st_usbotgfs_usb_init")));
+drv_status_t usb_release(uint32_t label) __attribute__((alias("st_usbotgfs_usb_release")));
+drv_status_t usb_send_data(uint32_t label,
+                           uint8_t *src,
+                           uint32_t size,
+                           uint8_t ep) __attribute__((alias("st_usbotgfs_usb_send_data")));
+drv_status_t usb_set_recv_fifo(uint32_t label,
+                               uint8_t *dst,
+                               uint32_t size,
+                               uint8_t ep) __attribute__((alias("st_usbotgfs_usb_set_recv_fifo")));
+drv_status_t usb_send_zlp(uint32_t label, uint8_t ep) __attribute__((alias("st_usbotgfs_usb_send_zlp")));
+drv_status_t usb_global_stall(uint32_t label) __attribute__((alias("st_usbotgfs_usb_global_stall")));
+drv_status_t usb_global_stall_clear(uint32_t label) __attribute__((alias("st_usbotgfs_usb_global_stall_clear")));
+drv_status_t usb_endpoint_stall(uint32_t label,
+                                uint8_t ep_id,
+                                enum usb_endpoint_direction dir) __attribute__((alias("st_usbotgfs_usb_endpoint_stall")));
+drv_status_t usb_endpoint_stall_clear(uint32_t label,
+                                      uint8_t ep_id,
+                                      enum usb_endpoint_direction dir) __attribute__((alias("st_usbotgfs_usb_endpoint_stall_clear")));
+drv_status_t usb_endpoint_set_nak(uint32_t label,
+                                  uint8_t ep_id,
+                                  enum usb_endpoint_direction dir) __attribute__((alias("st_usbotgfs_usb_endpoint_set_nak")));
+drv_status_t usb_endpoint_clear_nak(uint32_t label,
+                                    uint8_t ep_id,
+                                    enum usb_endpoint_direction dir) __attribute__((alias("st_usbotgfs_usb_endpoint_clear_nak")));
+drv_status_t usb_configure_endpoint(uint32_t label,
+                                    uint8_t ep,
+                                    enum usb_endpoint_type type,
+                                    enum usb_endpoint_direction dir,
+                                    enum usb_endpoint_mpsize mpsize,
+                                    enum usb_endpoint_toggle dtoggle,
+                                    usb_ioep_handler_t handler) __attribute__((alias("st_usbotgfs_usb_configure_endpoint")));
+drv_status_t usb_deconfigure_endpoint(uint32_t label,
+                                      uint8_t ep) __attribute__((alias("st_usbotgfs_usb_deconfigure_endpoint")));
+drv_status_t usb_activate_endpoint(uint32_t label,
+                                   uint8_t ep,
+                                   enum usb_endpoint_direction dir) __attribute__((alias("st_usbotgfs_usb_activate_endpoint")));
+drv_status_t usb_deactivate_endpoint(uint32_t label,
+                                     uint8_t ep,
+                                     enum usb_endpoint_direction dir) __attribute__((alias("st_usbotgfs_usb_deactivate_endpoint")));
+drv_status_t usb_set_address(uint32_t label,
+                             uint16_t addr) __attribute__((alias("st_usbotgfs_usb_set_address")));
+drv_status_t usb_get_ep_state(uint32_t label,
+                              uint8_t epnum,
+                              enum usb_endpoint_direction dir,
+                              enum usb_endpoint_state *state) __attribute__((alias("st_usbotgfs_usb_get_ep_state")));
+drv_status_t usb_get_ep_mpsize(uint32_t label,
+                               enum usb_endpoint_type type,
+                               uint16_t *mpsize) __attribute__((alias("st_usbotgfs_usb_get_ep_mpsize")));
+drv_status_t usb_get_speed(uint32_t label,
+                           enum usb_port_speed *speed) __attribute__((alias("st_usbotgfs_usb_get_speed")));
